@@ -12,6 +12,7 @@ $OpenM_Dir = "C:\Program Files\Dell\SysMgt\oma\bin"
 $RMM_Reg_Path = "Registry::HKEY_LOCAL_MACHINE\SOFTWARE\CentraStage"
 $OpenManageUDF = "Custom30"
 $DRAC_UDFS = @{
+    Raid = "Custom25"
     Fan = "Custom26";
     Temp = "Custom27";
     Power = "Custom28";
@@ -50,6 +51,7 @@ Function Invoke-IDRAC_Request {
         [string]$UN,
         [string]$Pass
     )
+    $Req = ""
 # Nessecary to make request to API with self-signed cert
 add-type @"
     using System.Net;
@@ -66,12 +68,32 @@ add-type @"
 
     [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Ssl3, [Net.SecurityProtocolType]::Tls, [Net.SecurityProtocolType]::Tls11, [Net.SecurityProtocolType]::Tls12
 
-
     $Headers = @{'Accept'='application/json'}
     $User = $UN
     $PWord = ConvertTo-SecureString -String $Pass -AsPlainText -Force
     $Cred = New-Object -TypeName System.Management.Automation.PSCredential -ArgumentList $User, $PWord
-    Invoke-RestMethod -Uri $uri -Credential $Cred -Method Get -ContentType 'application/json' -Headers $Headers
+    try{
+        $Req = Invoke-RestMethod -Uri $uri -Credential $Cred -Method Get -ContentType 'application/json' -Headers $Headers
+    }Catch{
+        $Req = 1
+    }
+    Return $Req
+}
+
+<#.DESCRIPTION
+Probably a better way to extract the links, but this works.
+Casting to string, splitting the string, and trimming to extract
+the different sensor links. All because I could not access the "odata.id"
+property.
+#>
+Function Select-Links {
+    param(
+        $Ldata
+    )
+    $TempStr = [string]$Ldata
+    $TpStrArr = $TempStr.Split("=")
+    $TempPartLink = $TpStrArr[1].Trim("}")
+    Return $TempPartLink
 }
 
 Function Get-SensorInfo {
@@ -79,17 +101,82 @@ Function Get-SensorInfo {
     $Sensors = Invoke-IDRAC_Request -Uri $URIS["SenseURI"] -UN $DRAC_UN -Pass $DRAC_Pass
     $SenLinks = $Sensors.Members
     for ($i = 0; $i -lt $SenLinks.Count; $i++) {
-        # Probably a better way to extract the links, but this works.
-        # Casting to string, splitting the string, and trimming to extract
-        # the different sensor links. All because I could not access the "odata.id"
-        # property.
-        $TempStr = [string]$SenLinks[$i]
-        $TpStrArr = $TempStr.Split("=")
-        $TempPartLink = $TpStrArr[1].Trim("}")
+        $TempPartLink = Select-Links -Ldata $SenLinks[$i]
         $TempInfo = Invoke-IDRAC_Request -Uri "https://$DRAC_IP$($TempPartLink)" -UN $DRAC_UN -Pass $DRAC_Pass
         $AllSenInfo += $TempInfo
     }
     return $AllSenInfo
+}
+
+<#.DESCRIPTION
+This function differs a bit from the "Get-SensorInfo" in the way it functions. It needs
+to probe a layer deeper for the links to the drives in the raid array.
+#>
+Function Get-StorageInfo {
+    $StorInfo = @{}
+    $Allinfo = Invoke-IDRAC_Request -Uri $URIS["MainURI"] -UN $DRAC_UN -Pass $DRAC_Pass
+    $RawStorLinks = $Allinfo.Links.Storage
+    for ($i = 0; $i -lt $RawStorLinks.Count; $i++) {
+        $TempPartLink = Select-Links -Ldata $RawStorLinks[$i]
+        $TempInfo = Invoke-IDRAC_Request -Uri "https://$DRAC_IP$($TempPartLink)" -UN $DRAC_UN -Pass $DRAC_Pass
+        $StorInfo[$TempInfo.Id] += $TempInfo
+    }
+    # Checking for RAID array drives in the "StorInfo" hashmap. Then extracting
+    # the link information, sending a request using the link info, and adding the
+    # disk information fetched from the request to an array. Will be an array of objects.
+    $RaidDiskInfo = @()
+    foreach($storage in $StorInfo.GetEnumerator()){
+        if($storage.Key -like '*RAID*'){
+            for($i=0;$i -lt $storage.Value.Drives.Count; $i++) {
+                $TmpPtLnk = Select-Links -Ldata $storage.Value.Drives[$i]
+                $TempInfo = Invoke-IDRAC_Request -Uri "https://$DRAC_IP$($TmpPtLnk)" -UN $DRAC_UN -Pass $DRAC_Pass
+                $RaidDiskInfo += $TempInfo
+            }
+        }
+    }
+    # Adding the array containing objects with each disk's info
+    # to the parent object containing the rest of the storage info
+    $StorInfo['RaidDiskInfo'] = $RaidDiskInfo
+    Return $StorInfo
+}
+
+<#.DESCRIPTION
+This function is meant to select a few properties from each object in the hashmap returned 
+from the "Get-StorageInfo" function and return another, smaller, hashmap for the "Publish-MonitorData"
+function display in RMM. This function can be changed later to add or remove properties the user would
+like to monitor. Right now this only pulls out data about each disk's health in a raid array.
+#>
+Function Select-StorageData {
+    param(
+        $StorData
+    )
+    $StorageMap = @{}
+    $TypeChx = $StorData.GetType()
+    if($TypeChx.Name -ne "Hashtable"){
+        $StorageMap["No_Data"] = "Unable to retrieve iDRAC Data."
+        Return $StorageMap
+    }
+    # Converting key collection to an array to check if passed in data
+    # contains the key "RaidDiskInfo" before attempting to parse data.
+    $KeyArr = [Array]$StorData.Keys
+    if(!$KeyArr.Contains("RaidDiskInfo")){
+        $StorageMap["No_Data"] = "Unable to retrieve status of disks in RAID array."
+        Return $StorageMap
+    }
+    for($i=0;$i -lt $StorData.RaidDiskInfo.Count;$i++){
+        $TempMap = @{}
+        # Extracting portion of name property to create a
+        # succint key for the disk in "$StorData"
+        $NameArr = $StorData.RaidDiskInfo[$i].Name.Split()
+        $NameDigis = $NameArr[$NameArr.Count - 1].Split(":")
+        $NewKey = "Disk$($NameDigis[2])_Array$($NameDigis[1])"
+        $TempMap["FailurePredicted"] = $StorData.RaidDiskInfo[$i].FailurePredicted
+        $TempMap["FailurePredicted"] = $StorData.RaidDiskInfo[$i].FailurePredicted
+        $TempMap["Health"] = $StorData.RaidDiskInfo[$i].Status.Health
+        $StorageMap[$NewKey] = $TempMap
+    }
+
+    Return $StorageMap
 }
 
 Function Convert-iDracData {
@@ -136,7 +223,8 @@ but this function will handle the rest.
 #>
 Function Publish-MonitorData {
     param(
-        [Hashtable]$Data,
+        [Hashtable]$Sense_Data,
+        [Hashtable]$Stor_Data,
         [String]$Path,
         [Int32]$TmpLim,
         [Int32]$WttLim,
@@ -149,7 +237,7 @@ Function Publish-MonitorData {
     # Need to check if iDrac was able to return data by looking for "No_Data" key.
     # No alert will be raised or display string will be created if data was not retrieved from iDrac, but a message
     # will be displayed to the RMM console to inform the tech.
-    foreach ($status in $Data.GetEnumerator()) {
+    foreach ($status in $Sense_Data.GetEnumerator()) {
         if($status.Key -eq "No_Data"){
             $No_Data = $True
             $DisplayStatus = $status.Value
@@ -159,7 +247,7 @@ Function Publish-MonitorData {
     # Only applicable if data was retrieved from iDRAC
     if($No_Data -eq $False){
         # 
-        foreach ($sensor in $Data.GetEnumerator()) {
+        foreach ($sensor in $Sense_Data.GetEnumerator()) {
             # If any temp reading goes over 70 celcius, raise an alert.
             if($sensor.Key -like '*Temp*'){
                 # Extracting and casting temp reading to integer
@@ -191,7 +279,7 @@ Function Publish-MonitorData {
             }
         }
         
-        # Two different display strings are needed for the RMM console. One wil be used to 
+        # Two different display strings are needed for the RMM console. One will be used to 
         # populate a UDF for a specific reading (like Fan or Temperature readings). While another
         # string will be used to provide information to the RMM monitor. The RMM monitor string will
         # contain all the readings.
@@ -199,7 +287,7 @@ Function Publish-MonitorData {
         $TempString = ""
         $PowerString = ""
         $VoltString = ""
-        foreach ($sensor in $Data.GetEnumerator()) {
+        foreach ($sensor in $Sense_Data.GetEnumerator()) {
             if($sensor.Key -like '*Temp*'){
                 $TempString += "$($sensor.Key): $($sensor.Value.Reading); "
                 $DisplayStatus += "$($sensor.Key): $($sensor.Value.Reading); "
@@ -219,6 +307,32 @@ Function Publish-MonitorData {
         Set-RMMStatus -Path $Path -Status "$PowerString $(Get-Date)" -UDF $Fields["Power"]
         Set-RMMStatus -Path $Path -Status "$VoltString $(Get-Date)" -UDF $Fields["Voltage"]
     }
+
+    # Checking and parsing storage/RAID data before passing on to RMM
+    # Will continue to use the "Alert" variable as the storage status
+    # is pulled from iDRAC.
+    $No_Stor = $False
+    $StorString = ""
+    foreach ($stat in $Stor_Data.GetEnumerator()) {
+        if($status.Key -eq "No_Data"){
+            $No_Stor = $True
+            $DisplayStatus += $stat.Value
+            break
+        }
+    }
+    # Checking if an alert needs to be raised and creating display string for storage status
+    # after confirming above that data was retrieved.
+    if($No_Stor -eq $False){
+        foreach ($disk in $Stor_Data.GetEnumerator()) {
+            if(($disk.Value.FailurePredicted) -or ($disk.Value.Health -ne "OK")){
+                $Alert = $True
+            }
+            $StorString += "$($disk.Key): FailurePredicted=$($disk.Value.FailurePredicted),Health=$($disk.Value.Health); "
+            $DisplayStatus += "$($disk.Key): FailurePredicted=$($disk.Value.FailurePredicted),Health=$($disk.Value.Health); "
+        }
+    }
+    Set-RMMStatus -Path $Path -Status "$StorString $(Get-Date)" -UDF $Fields["Raid"]
+
     # If no alert is raised after checking OpenManage and iDrac.
     if(($Alert -eq $False) -and ($OM_Alert["Status"] -eq $False)){
         Write-Host '<-Start Result->'
@@ -263,7 +377,7 @@ Function Get-OpenMRep {
 }
 
 <#.DESCRIPTION
-This function is mostly meant to confirm useable data was returned from the
+This function is mostly meant to confirm usable data was returned from the
 "Get-OpenMRep" function and convert it into a hashtable to make it easier to
 check for alerts in the "Publish-OMData" function.
 #>
@@ -339,12 +453,15 @@ $OM_Table = Convert-OMData -Data $OpenData
 $OM_Returned = Publish-OMData -Data $OM_Table -UDF $OpenManageUDF -Path $RMM_Reg_Path
 $OM_Alert = $OM_Returned[1]
 
+# Fetching Storage Status Data
+$RawStorData = Get-StorageInfo
+$StorMap = Select-StorageData -StorData $RawStorData
+
 $SensorData = Get-SensorInfo
 $SensorMap = Convert-iDracData -Data $SensorData
-Publish-MonitorData -Data $SensorMap -Path $RMM_Reg_Path -TmpLim $TempLimit -WttLim $WattLimit -OM_Alert $OM_Alert -Fields $DRAC_UDFS
+Publish-MonitorData -Sense_Data $SensorMap -Stor_Data $StorMap -Path $RMM_Reg_Path -TmpLim $TempLimit -WttLim $WattLimit -OM_Alert $OM_Alert -Fields $DRAC_UDFS
 
 # Variable Cleanup
-Remove-Item Env:\Site_DRAC_PW
 Clear-Variable -Name "DRAC_IP"
 Remove-Variable -Name DRAC_IP
 Clear-Variable -Name "DRAC_UN"
@@ -356,3 +473,4 @@ Remove-Item Env:\Site_DRAC_IP
 [Environment]::SetEnvironmentVariable("Site_DRAC_UN",$null,"User")
 Remove-Item Env:\Site_DRAC_UN
 [Environment]::SetEnvironmentVariable("Site_DRAC_PW",$null,"User")
+Remove-Item Env:\Site_DRAC_PW
